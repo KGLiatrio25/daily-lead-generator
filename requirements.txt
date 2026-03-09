@@ -1,4 +1,266 @@
-feedparser==6.0.11
-gspread==6.1.2
-google-auth==2.29.0
-requests==2.31.0
+import feedparser
+import datetime
+import csv
+import os
+import json
+import urllib.parse
+import time
+from target_companies import (
+    TARGET_COMPANIES, TRIGGER_KEYWORDS, ALL_TRIGGER_KEYWORDS,
+    VERTICALS, TARGET_TITLES
+)
+def search_google_news(query, num_results=10):
+    """Search Google News RSS feed for a query."""
+    encoded_query = urllib.parse.quote(query)
+    url = f"https://news.google.com/rss/search?q={encoded_query}&hl=en-US&gl=US&ceid=US:en"
+    try:
+        feed = feedparser.parse(url)
+        results = []
+        for entry in feed.entries[:num_results]:
+            results.append({
+                "title": entry.get("title", ""),
+                "link": entry.get("link", ""),
+                "published": entry.get("published", ""),
+                "source": entry.get("source", {}).get("title", "Unknown")
+            })
+        return results
+    except Exception as e:
+        print(f"  Error fetching news for query: {e}")
+        return []
+def score_and_categorize(title, company):
+    """
+    Score an article and categorize by Liatrio service area.
+    Returns (score, primary_category, matched_keywords).
+    """
+    title_lower = title.lower()
+    category_scores = {}
+    all_matched = []
+    for category, keywords in TRIGGER_KEYWORDS.items():
+        matched = []
+        for keyword in keywords:
+            if keyword.lower() in title_lower:
+                matched.append(keyword)
+        if matched:
+            category_scores[category] = len(matched)
+            all_matched.extend(matched)
+    if not all_matched:
+        return 0, "No Match", []
+    # Total score
+    score = sum(category_scores.values())
+    # Bonus for vertical relevance
+    for vertical in VERTICALS:
+        if vertical.lower() in title_lower:
+            score += 0.5
+            break
+    # Primary category is the one with most keyword matches
+    primary_category = max(category_scores, key=category_scores.get)
+    return score, primary_category, all_matched
+def search_for_contacts(company):
+    """
+    Search Google for likely contacts at the company matching target titles.
+    Returns a list of potential contacts found in search results.
+    Uses public sources like press releases, LinkedIn previews, and company pages.
+    """
+    contacts = []
+    seen_names = set()
+    # Search for key leadership roles at the company
+    search_groups = [
+        f'"{company}" CIO OR CTO OR "Chief Digital Officer" site:linkedin.com',
+        f'"{company}" "VP of Engineering" OR "VP of Technology" OR "VP of DevOps" site:linkedin.com',
+        f'"{company}" "Director of Engineering" OR "Director of Platform" OR "Director of Cloud" site:linkedin.com',
+        f'"{company}" "Head of Engineering" OR "Enterprise Architect" OR "Cloud Architect" site:linkedin.com',
+        f'"{company}" CIO OR CTO announcement OR appointed OR named',
+    ]
+    for query in search_groups:
+        try:
+            encoded_query = urllib.parse.quote(query)
+            url = f"https://news.google.com/rss/search?q={encoded_query}&hl=en-US&gl=US&ceid=US:en"
+            feed = feedparser.parse(url)
+            for entry in feed.entries[:5]:
+                title = entry.get("title", "")
+                link = entry.get("link", "")
+                # Extract potential names and titles from headlines
+                # Headlines often follow patterns like "John Smith named CIO of Company"
+                for target_title in TARGET_TITLES:
+                    if target_title.lower() in title.lower():
+                        contact_entry = {
+                            "name": "See article",
+                            "likely_title": target_title,
+                            "source": title,
+                            "source_url": link,
+                            "company": company
+                        }
+                        contact_key = f"{company}_{target_title}"
+                        if contact_key not in seen_names:
+                            seen_names.add(contact_key)
+                            contacts.append(contact_entry)
+            time.sleep(0.5)  # Be respectful with rate limiting
+        except Exception as e:
+            print(f"  Error searching contacts for {company}: {e}")
+            continue
+    return contacts[:15]  # Cap at 15 contacts per company
+def generate_contact_search_urls(company):
+    """
+    Generate helpful search URLs for manually finding contacts.
+    These can be clicked to quickly find the right people.
+    """
+    urls = []
+    # LinkedIn Sales Navigator / LinkedIn search URLs
+    titles_to_search = [
+        "CIO", "CTO", "VP Engineering", "VP Technology",
+        "Director Platform Engineering", "Director DevOps",
+        "Chief Digital Officer", "Enterprise Architect",
+        "Head of Engineering", "Director Cloud Infrastructure"
+    ]
+    for title in titles_to_search:
+        linkedin_url = f"https://www.linkedin.com/search/results/people/?keywords={urllib.parse.quote(title + ' ' + company)}"
+        google_url = f"https://www.google.com/search?q={urllib.parse.quote(f'{company} {title} linkedin')}"
+        urls.append({
+            "title": title,
+            "company": company,
+            "linkedin_search": linkedin_url,
+            "google_search": google_url
+        })
+    return urls
+def run_lead_generator():
+    """Main function to generate leads aligned with Liatrio's offerings."""
+    print(f"{'='*60}")
+    print(f"LIATRIO LEAD GENERATOR")
+    print(f"Running at {datetime.datetime.now()}")
+    print(f"{'='*60}\\n")
+    all_leads = []
+    all_contacts = []
+    all_search_urls = []
+    seen_titles = set()
+    for i, company in enumerate(TARGET_COMPANIES, 1):
+        print(f"[{i}/{len(TARGET_COMPANIES)}] Searching: {company}")
+        # Build search queries aligned with Liatrio services
+        search_queries = [
+            # Enterprise AI
+            f'"{company}" AI adoption OR AI strategy OR generative AI OR "AI transformation"',
+            # DevOps & Platform
+            f'"{company}" DevOps OR "platform engineering" OR Kubernetes OR "developer experience"',
+            # App Modernization & Cloud
+            f'"{company}" "cloud migration" OR "application modernization" OR "legacy modernization" OR "cloud-native"',
+            # Security & Compliance
+            f'"{company}" DevSecOps OR "software supply chain" OR "zero trust" OR FedRAMP OR CMMC',
+            # Leadership & Transformation
+            f'"{company}" "new CIO" OR "new CTO" OR "digital transformation" OR "technology transformation"',
+            # Strategic signals
+            f'"{company}" "technology contract" OR "IT modernization" OR "engineering hiring" OR "developer productivity"',
+        ]
+        company_has_leads = False
+        for query in search_queries:
+            articles = search_google_news(query, num_results=5)
+            for article in articles:
+                if article["title"] in seen_titles:
+                    continue
+                seen_titles.add(article["title"])
+                score, category, keywords = score_and_categorize(
+                    article["title"], company
+                )
+                if score > 0:
+                    company_has_leads = True
+                    lead = {
+                        "company": company,
+                        "liatrio_service_area": category,
+                        "trigger_type": category,
+                        "headline": article["title"],
+                        "source": article["source"],
+                        "url": article["link"],
+                        "published": article["published"],
+                        "relevance_score": score,
+                        "matched_keywords": ", ".join(keywords),
+                        "suggested_outreach_angle": get_outreach_angle(category)
+                    }
+                    all_leads.append(lead)
+            time.sleep(0.3)  # Rate limiting
+        # If this company had trigger events, find contacts
+        if company_has_leads:
+            print(f"  -> Found triggers! Searching for contacts...")
+            contacts = search_for_contacts(company)
+            all_contacts.extend(contacts)
+            # Generate search URLs for manual prospecting
+            search_urls = generate_contact_search_urls(company)
+            all_search_urls.extend(search_urls)
+    # Sort leads by relevance score
+    all_leads.sort(key=lambda x: x["relevance_score"], reverse=True)
+    # === SAVE OUTPUTS ===
+    output_dir = "output"
+    os.makedirs(output_dir, exist_ok=True)
+    date_str = datetime.datetime.now().strftime("%Y-%m-%d")
+    # 1. Save leads CSV
+    leads_file = f"{output_dir}/leads_{date_str}.csv"
+    with open(leads_file, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=[
+            "company", "liatrio_service_area", "trigger_type", "headline",
+            "source", "url", "published", "relevance_score",
+            "matched_keywords", "suggested_outreach_angle"
+        ])
+        writer.writeheader()
+        writer.writerows(all_leads)
+    # 2. Save contacts CSV
+    contacts_file = f"{output_dir}/contacts_{date_str}.csv"
+    with open(contacts_file, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=[
+            "company", "name", "likely_title", "source", "source_url"
+        ])
+        writer.writeheader()
+        writer.writerows(all_contacts)
+    # 3. Save prospecting search URLs
+    search_file = f"{output_dir}/prospecting_links_{date_str}.csv"
+    with open(search_file, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=[
+            "company", "title", "linkedin_search", "google_search"
+        ])
+        writer.writeheader()
+        writer.writerows(all_search_urls)
+    # 4. Save full JSON
+    json_file = f"{output_dir}/full_report_{date_str}.json"
+    report = {
+        "generated_at": str(datetime.datetime.now()),
+        "total_leads": len(all_leads),
+        "total_contacts": len(all_contacts),
+        "companies_with_triggers": len(set(l["company"] for l in all_leads)),
+        "leads": all_leads,
+        "contacts": all_contacts,
+        "prospecting_links": all_search_urls
+    }
+    with open(json_file, "w", encoding="utf-8") as f:
+        json.dump(report, f, indent=2, ensure_ascii=False)
+    # === PRINT SUMMARY ===
+    print(f"\\n{'='*60}")
+    print(f"RESULTS SUMMARY")
+    print(f"{'='*60}")
+    print(f"Total leads found: {len(all_leads)}")
+    print(f"Companies with triggers: {len(set(l['company'] for l in all_leads))}")
+    print(f"Contacts found: {len(all_contacts)}")
+    print(f"\\nLeads by Liatrio Service Area:")
+    service_counts = {}
+    for lead in all_leads:
+        area = lead["liatrio_service_area"]
+        service_counts[area] = service_counts.get(area, 0) + 1
+    for area, count in sorted(service_counts.items(), key=lambda x: x[1], reverse=True):
+        print(f"  {area}: {count}")
+    print(f"\\n--- TOP 25 LEADS ---")
+    for i, lead in enumerate(all_leads[:25], 1):
+        print(f"\\n{i}. [{lead['liatrio_service_area']}] {lead['company']}")
+        print(f"   {lead['headline']}")
+        print(f"   Score: {lead['relevance_score']} | Outreach: {lead['suggested_outreach_angle']}")
+    print(f"\\nFiles saved to {output_dir}/")
+    return all_leads
+def get_outreach_angle(category):
+    """Return a suggested Liatrio outreach angle based on the trigger category."""
+    angles = {
+        "Enterprise AI": "Liatrio helps enterprises move from AI pilots to production-scale AI. Offer an AI Strategy Session.",
+        "DevOps & Platform Engineering": "Liatrio builds internal developer platforms that accelerate delivery. Offer a DevOps maturity assessment.",
+        "Application Modernization": "Liatrio turns legacy apps into cloud-native, AI-ready software. Offer a modernization roadmap.",
+        "Cloud Migration": "Liatrio designs AI-ready cloud platforms. Offer a cloud migration assessment.",
+        "Security & Compliance": "Liatrio integrates security into the software delivery pipeline. Offer a DevSecOps assessment.",
+        "Digital Transformation": "Liatrio drives holistic transformation across people, process, and technology. Reference the leadership change and offer a strategy session.",
+        "Strategic Signal": "Company is investing in technology. Position Liatrio as their transformation partner.",
+        "Workforce Enablement": "Liatrio coaches engineering teams to become high-performing. Offer a team enablement workshop.",
+    }
+    return angles.get(category, "Position Liatrio as enterprise transformation partner.")
+if __name__ == "__main__":
+    run_lead_generator()

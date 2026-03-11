@@ -1,9 +1,8 @@
 name: Liatrio Daily Lead Generator
 on:
   schedule:
-    # Runs every day at 11:00 AM UTC (6:00 AM EST / 3:00 AM PST)
     - cron: '0 11 * * 1-5'
-  workflow_dispatch: # Allows manual trigger
+  workflow_dispatch:
 jobs:
   generate-leads:
     runs-on: ubuntu-latest
@@ -21,6 +20,11 @@ jobs:
         run: pip install -r requirements.txt
       - name: Run lead generator
         run: python lead_generator.py
+      - name: Research contacts via Claude API
+        if: env.ANTHROPIC_API_KEY != ''
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: python salesnav_automation.py --no-browser --date $(date +'%Y-%m-%d')
       - name: Commit and push results
         run: |
           git config --local user.email "github-actions[bot]@users.noreply.github.com"
